@@ -1,0 +1,6 @@
+# Cloud backends: Gemini (decisions and embeddings), Spanner Graph, Vertex evaluation, Braintrust.
+-r requirements.txt
+google-genai>=2.0.0
+google-cloud-spanner>=3.47.0
+google-cloud-aiplatform[evaluation]>=2.0.0
+braintrust>=0.0.150
