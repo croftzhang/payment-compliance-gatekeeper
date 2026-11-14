@@ -28,7 +28,7 @@ from config import load_config
 from faiss_regulatory_store import FAISSRegulatoryRetriever
 from spanner_graph_client import SpannerGraphComplianceClient
 
-STRATA_ORDER = ["core", "structured", "text_signal", "text_distractor"]
+STRATA_ORDER = ["core", "structured", "text_signal", "text_distractor", "name_alert", "name_near_miss"]
 
 # First-attempt gate errors, grouped by what went wrong.
 _ERROR_CATEGORIES = [
@@ -40,6 +40,9 @@ _ERROR_CATEGORIES = [
     ("Hypothesis mismatch", "hypothesis list"),
     ("entity_id", "entity ids"),
     ("Ownership math", "ownership arithmetic"),
+    ("sanctions-list match must be BLOCK", "list match not blocked"),
+    ("list_id", "list match ids"),
+    ("List match mismatch", "list match ids"),
     ("Policy violation", ">=50% not blocked"),
 ]
 
@@ -194,7 +197,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="ownership graph backend (mock = local in-memory graph)")
     parser.add_argument("--embeddings", default="hash", choices=["hash", "gemini"],
                         help="vectors for FAISS retrieval (hash = offline keyword stand-in)")
-    parser.add_argument("--dataset", default="all", choices=["core", "extended", "all"])
+    parser.add_argument("--dataset", default="all", choices=["core", "extended", "names", "all"])
     parser.add_argument("--braintrust", action="store_true",
                         help="record the runs as Braintrust experiments (one per mode)")
     parser.add_argument("--vertex-eval", action="store_true",
@@ -202,7 +205,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--out", default="results", help="folder for result files")
     args = parser.parse_args(argv)
 
-    dataset = {"core": ev.EVAL_DATASET, "extended": ev.EXTENDED_DATASET, "all": ev.ALL_CASES}[args.dataset]
+    dataset = {"core": ev.EVAL_DATASET, "extended": ev.EXTENDED_DATASET,
+               "names": ev.NAME_DATASET, "all": ev.ALL_CASES}[args.dataset]
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
     print(f"Modes: {args.modes} | graph: {args.graph} | embeddings: {args.embeddings} | "

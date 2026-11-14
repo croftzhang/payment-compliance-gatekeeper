@@ -245,6 +245,26 @@ class SpannerGraphComplianceClient:
             return []
         return self._rows_to_paths(enumerate_owner_paths(entities, edges, beneficiary_id))
 
+    def get_entity_record(self, entity_id: str) -> Optional[Dict[str, str]]:
+        """Name and country on record for an entity, or None if it is not a known entity.
+
+        Used by name screening when the payment message carries no beneficiary name.
+        """
+        if self.use_mock:
+            record = reference_data.entity_index().get(entity_id)
+            if record is None:
+                return None
+            return {"entity_name": record["entity_name"], "jurisdiction": record["jurisdiction"]}
+        with self.database.snapshot() as snapshot:
+            rows = list(snapshot.execute_sql(
+                "SELECT entity_name, jurisdiction FROM Entities WHERE entity_id = @entity_id",
+                params={"entity_id": entity_id},
+                param_types={"entity_id": spanner.param_types.STRING},
+            ))
+        if not rows:
+            return None
+        return {"entity_name": rows[0][0], "jurisdiction": rows[0][1]}
+
     # ---------------- Tool 2: Metrics Probe (Velocity & Structuring) ----------------
     def query_payment_metrics(self, tx: PaymentTransaction) -> List[TelemetryObservation]:
         if tx.beneficiary_id == "ENT-BEN-9001":

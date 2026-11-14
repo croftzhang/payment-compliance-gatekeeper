@@ -89,6 +89,25 @@ OWNERSHIP: List[Tuple[str, str, float, date]] = [
     ("ENT-SHELL-F", "ENT-SHELL-E", 0.10, _LONG_STANDING),
 ]
 
+# Synthetic sanctions list. `entity_id` links an entry to its node in the ownership graph.
+SANCTIONS_LIST: List[Dict] = [
+    {
+        "list_id": "SDN-90001", "entity_id": "ENT-UBO-SDN1",
+        "name": "Vostok Maritime Holdings Ltd", "aliases": ["Vostok Maritime"],
+        "country": "VG", "registration_no": "VG-1482207", "program": "OFAC-SDN",
+    },
+    {
+        "list_id": "SDN-90002", "entity_id": "ENT-UBO-SDN2",
+        "name": "Korvald Meridian Trading FZE", "aliases": ["Korvald Trading"],
+        "country": "AE", "registration_no": "AE-JAFZ-55310", "program": "OFAC-SDN",
+    },
+    {
+        "list_id": "SDN-90003", "entity_id": "ENT-UBO-SDN3",
+        "name": "Ostrava Dune Logistics LLC", "aliases": ["Ostrava Dune"],
+        "country": "AE", "registration_no": "AE-DXB-99120", "program": "OFAC-SDN",
+    },
+]
+
 BENEFICIARY_IDS: List[str] = [
     "ENT-BEN-9001", "ENT-BEN-7700", "ENT-BEN-1002", "ENT-BEN-2200",
     "ENT-BEN-4990", "ENT-BEN-5000", "ENT-BEN-3300",

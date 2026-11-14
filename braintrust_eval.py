@@ -11,6 +11,8 @@ Datasets:
   * EVAL_DATASET     - the three original cases. The rule path scores 1.0 on all of them.
   * EXTENDED_DATASET - nine more: boundary ownership structures, signals that exist
                        only in the remittance text, and misleading remittance text.
+  * NAME_DATASET     - six on sanctions-list name screening: confirmed matches, a
+                       same-name different company, and names just under the threshold.
 """
 
 import argparse
@@ -129,7 +131,9 @@ _T_DOM = ["query_payment_metrics", "trace_beneficial_owners"]
 
 
 def _case(stratum, note, tx_id, beneficiary, amount, purpose, cross_border, remittance,
-          decision, pct, rule, runbook, hypotheses, trajectory, min_sources=2):
+          decision, pct, rule, runbook, hypotheses, trajectory, min_sources=2, party=None):
+    """One evaluation case. `party` = (name, country, registration no.) as written on the payment."""
+    name, country, registration = party or ("", "", "")
     return {
         "stratum": stratum,
         "note": note,
@@ -142,6 +146,9 @@ def _case(stratum, note, tx_id, beneficiary, amount, purpose, cross_border, remi
             "purpose_code": purpose,
             "cross_border": cross_border,
             "remittance_info": remittance,
+            "beneficiary_name": name,
+            "beneficiary_country": country,
+            "beneficiary_registration_no": registration,
         },
         "expected": {
             "decision": decision,
@@ -202,7 +209,41 @@ EXTENDED_DATASET: List[Dict[str, Any]] = [
           ["HYP-SWIFT-EVASION"], _T_XB),
 ]
 
-ALL_CASES: List[Dict[str, Any]] = EVAL_DATASET + EXTENDED_DATASET
+_T_LIST_XB = ["resolve_list_hits"] + _T_XB
+_LIST_DOCS = ("REG-SDN-LIST-MATCH", "RB-LIST-HIT-05")
+
+# Name screening. The beneficiaries are external parties with no record of their own:
+# the only information is what the payment message says about them.
+NAME_DATASET: List[Dict[str, Any]] = [
+    # --- name_alert: the name scores above the alert threshold; code compares identifiers
+    _case("name_alert", "listed party, confirmed by its registration number",
+          "TX-2026-8101", "EXT-8101", 240000.0, "VESSEL_CHARTER", True, "",
+          "BLOCK", 0.0, *_LIST_DOCS, ["HYP-LIST-MATCH"], _T_LIST_XB,
+          party=("Vostok Maritime Holdings Limited", "VG", "VG-1482207")),
+    _case("name_alert", "identical name and country, no registration number given",
+          "TX-2026-8102", "EXT-8102", 56000.0, "TRADE_SETTLEMENT", True, "",
+          "BLOCK", 0.0, *_LIST_DOCS, ["HYP-LIST-MATCH"], _T_LIST_XB,
+          party=("KORVALD MERIDIAN TRADING F.Z.E.", "AE", "")),
+    _case("name_alert", "same name, different company: country and registration number both differ",
+          "TX-2026-8103", "EXT-8103", 7400.0, "FREIGHT_FORWARDING", True, "",
+          "APPROVE", 0.0, *_LIST_DOCS, [], _T_LIST_XB,
+          party=("Ostrava Dune Logistics s.r.o.", "CZ", "CZ-27845113")),
+    _case("name_alert", "transliterated spelling, same country, nothing else to go on",
+          "TX-2026-8104", "EXT-8104", 9100.0, "BUNKER_SUPPLY", True, "",
+          "MANUAL_ESCALATION", 0.0, *_LIST_DOCS, ["HYP-LIST-MATCH"], _T_LIST_XB,
+          party=("Wostok Maritim Holding", "VG", "")),
+    # --- name_near_miss: both names score 0.80, just under the alert threshold
+    _case("name_near_miss", "abbreviated form of a listed name, same legal form and country",
+          "TX-2026-8105", "EXT-8105", 8300.0, "TRADE_SETTLEMENT", True, "",
+          "MANUAL_ESCALATION", 0.0, *_LIST_DOCS, [], _T_XB,
+          party=("Korvald Mer. Trdg FZE", "AE", "")),
+    _case("name_near_miss", "an unrelated domestic company that shares two common words",
+          "TX-2026-8106", "EXT-8106", 6100.0, "OFFICE_SUPPLIES", False, "",
+          "APPROVE", 0.0, "REG-DOMESTIC-LOW", "RB-DOMESTIC-STP-03", [], _T_DOM,
+          party=("Meridian Trading Co", "US", "US-DE-5512087")),
+]
+
+ALL_CASES: List[Dict[str, Any]] = EVAL_DATASET + EXTENDED_DATASET + NAME_DATASET
 
 
 def task_fn(input_data: dict, gk: Optional[PaymentComplianceGatekeeper] = None) -> dict:
@@ -229,6 +270,13 @@ def task_fn(input_data: dict, gk: Optional[PaymentComplianceGatekeeper] = None) 
         "retrieved_runbook_ids": [rb.runbook_id for rb in state["retrieved_runbooks"]],
         "text_driven_ids": state["text_driven_ids"],
         "graph_query_mode": gk.spanner_client.query_mode,
+        # Name screening: what was found, how code ruled on it, what the decision claims.
+        "name_hits": [
+            {"list_id": h.list_id, "party_name": h.party_name, "score": h.score,
+             "level": h.level, "verdict": h.verdict}
+            for h in state["name_hits"]
+        ],
+        "matched_list_ids": dec.matched_list_ids,
     }
 
 
@@ -361,6 +409,7 @@ def _trajectory_for_vertex(tool_names: List[str], tx_input: dict) -> List[Dict[s
         "query_swift_traces": by_tx,
         "trace_beneficial_owners": by_beneficiary,
         "query_kyc_audit_logs": by_beneficiary,
+        "resolve_list_hits": by_tx,
     }
     return [{"tool_name": name, "tool_input": tool_inputs.get(name, {})} for name in tool_names]
 
@@ -576,7 +625,7 @@ def run_evaluation_suite(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the evaluation suite with the rule path.")
     parser.add_argument("--extended", action="store_true",
-                        help="run all 12 cases instead of the 3 original ones")
+                        help="run all 18 cases instead of the 3 original ones")
     parser.add_argument("--braintrust", action="store_true",
                         help="also run through Braintrust Eval")
     parser.add_argument("--vertex-eval", action="store_true",

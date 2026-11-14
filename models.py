@@ -15,6 +15,11 @@ class PaymentTransaction(BaseModel):
     # Free text supplied by the payer (the remittance / payment-details line of the
     # payment message). The rule path never reads it; the Gemini path does.
     remittance_info: str = ""
+    # The beneficiary as written on the payment message. When the name is empty the
+    # screening step uses the name and country on the beneficiary's own record.
+    beneficiary_name: str = ""
+    beneficiary_country: str = ""
+    beneficiary_registration_no: str = ""
 
 
 class OwnershipPath(BaseModel):
@@ -32,10 +37,32 @@ class OwnershipPath(BaseModel):
     )
 
 
+class NameScreeningHit(BaseModel):
+    """A sanctions-list entry whose name resembles a party on the payment."""
+
+    list_id: str
+    listed_name: str
+    matched_on: str = Field(description="The listed name or alias that scored highest")
+    party_role: str
+    party_name: str
+    score: float = Field(description="Name similarity, 0.0 to 1.0")
+    level: Literal["ALERT", "NEAR_MISS"] = Field(
+        description="ALERT: at or above the screening threshold. NEAR_MISS: just below it; "
+        "code takes no action on these"
+    )
+    listed_country: Optional[str] = None
+    listed_registration_no: Optional[str] = None
+    listed_program: Optional[str] = None
+    country_check: Literal["match", "mismatch", "unknown", "not_checked"] = "not_checked"
+    registration_check: Literal["match", "mismatch", "unknown", "not_checked"] = "not_checked"
+    verdict: Literal["TRUE_MATCH", "FALSE_POSITIVE", "UNRESOLVED", "NOT_ADJUDICATED"] = "NOT_ADJUDICATED"
+    verdict_reason: str = ""
+
+
 # [1. Multi-source Observability] Unified telemetry observation model
 class TelemetryObservation(BaseModel):
     obs_id: str
-    source: Literal["SPANNER_GRAPH", "METRICS", "TRACES", "LOGS"]
+    source: Literal["SPANNER_GRAPH", "METRICS", "TRACES", "LOGS", "WATCHLIST"]
     entity_or_tx_id: str
     timestamp: str
     summary: str
@@ -51,6 +78,7 @@ class ComplianceHypothesis(BaseModel):
         "trace_beneficial_owners",
         "query_swift_traces",
         "query_kyc_audit_logs",
+        "resolve_list_hits",
     ]
     status: Literal["PENDING", "CONFIRMED", "REFUTED"] = "PENDING"
     supporting_obs_ids: List[str] = Field(default_factory=list)
@@ -96,6 +124,11 @@ class ComplianceDecision(BaseModel):
         description="Concrete remediation actions grounded in the cited Runbook"
     )
     rationale: str
+    matched_list_ids: List[str] = Field(
+        default_factory=list,
+        description="list_id of each sanctions-list entry judged to be the same party as "
+        "a party on the payment; empty if none",
+    )
 
 
 class GatekeeperState(TypedDict):
@@ -104,6 +137,8 @@ class GatekeeperState(TypedDict):
     observations: List[TelemetryObservation]
     tool_call_trajectory: List[str]
     ownership_paths: List[OwnershipPath]
+    # Sanctions-list screening results for the beneficiary name: alerts and near misses.
+    name_hits: List[NameScreeningHit]
     retrieved_rules: List[RegulatoryRule]
     retrieved_runbooks: List[ComplianceRunbook]
     # IDs (rules and runbooks) that were retrieved only because of the remittance

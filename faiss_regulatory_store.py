@@ -114,6 +114,18 @@ class FAISSRegulatoryRetriever:
                 "and is referred in the same way."
             ),
         },
+        {
+            "rule_id": "REG-SDN-LIST-MATCH",
+            "title": "Sanctions List Name Match - Adjudication Policy",
+            "content": (
+                "A payment to or from a party on the SDN list is prohibited. A screening "
+                "hit on a listed name or alias is settled with a secondary identifier "
+                "such as country or registration number: a hit confirmed as the same "
+                "party is rejected and reported; a hit shown to be a different party "
+                "with a similar name is documented and released; a hit the available "
+                "information cannot settle is held for review."
+            ),
+        },
     ]
 
     RUNBOOK_CORPUS = [
@@ -156,6 +168,16 @@ class FAISSRegulatoryRetriever:
                 "1. Hold the payment; neither release nor return the funds while it is under review.",
                 "2. Request the commercial documents behind it (invoice, bill of lading, end-user statement).",
                 "3. Refer the case to the sanctions desk with the payment text and the documents.",
+            ],
+        },
+        {
+            "runbook_id": "RB-LIST-HIT-05",
+            "title": "Sanctions List Hit Adjudication Runbook",
+            "trigger_condition": "sdn list name hit alias identifier adjudication",
+            "action_steps": [
+                "1. Compare the party's country and registration number with the list entry.",
+                "2. Same party: reject the payment and file the report. Different party: record why and release.",
+                "3. Not settled: hold the payment and request identifying documents from the originator.",
             ],
         },
     ]
@@ -211,7 +233,8 @@ class FAISSRegulatoryRetriever:
             "50", "blocked", "aggregate", "indirectly", "shell",
             "25", "cdd", "offshore", "edd",
             "cross-border", "10,000", "manual", "escalation",
-            "domestic", "fast-path", "low-risk", "us", "velocity", "restructuring"
+            "domestic", "fast-path", "low-risk", "us", "velocity", "restructuring",
+            "sdn", "alias", "identifier",
         ]
         for i, text in enumerate(texts):
             lower = text.lower()

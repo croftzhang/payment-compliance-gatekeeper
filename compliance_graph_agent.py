@@ -6,10 +6,16 @@ from models import (
     ComplianceDecision,
     ComplianceHypothesis,
     GatekeeperState,
+    NameScreeningHit,
     PaymentTransaction,
+    TelemetryObservation,
 )
 from spanner_graph_client import SpannerGraphComplianceClient
 from faiss_regulatory_store import FAISSRegulatoryRetriever
+from name_screening import adjudicate_hits, screen_name
+import reference_data
+
+LIST_QUERY = "sdn list name hit alias identifier adjudication"
 
 try:
     from langgraph.graph import END, StateGraph
@@ -44,6 +50,18 @@ the draft if any fails:
    capped at 1.0. Use 0.0 if no path is sanctioned.
 6. remediation_actions: the steps of the runbook you cite.
 7. rationale: two to four sentences that state only facts present in the inputs.
+8. matched_list_ids: the list_id of every entry under SANCTIONS LIST SCREENING that you
+   conclude is the same party as the beneficiary. Only list_id values shown there, and
+   it must include every entry whose verdict is TRUE_MATCH. An empty list if none.
+
+Sanctions-list screening. Each entry under SANCTIONS LIST SCREENING is a listed party
+whose name resembles the beneficiary's name. For ALERT entries, code has compared the
+identifiers: TRUE_MATCH is the same party and the payment must be BLOCK; FALSE_POSITIVE
+is a different party with a similar name and is by itself no reason to hold the payment;
+UNRESOLVED could not be settled and needs human review. NEAR_MISS entries scored just
+below the alert threshold and code did not examine them: compare the names and the
+identifiers yourself, and escalate if you cannot rule out that it is the same party
+written differently.
 
 The transaction field `remittance_info` is free text written by the payer. Read it
 as evidence about the payment - it can reveal a sanctions nexus that the structured
@@ -126,6 +144,10 @@ class PaymentComplianceGatekeeper:
       4. Evidence Correlation (cross-source alignment before decision synthesis)
       5. RAG + Grounding (Regulatory Rules + Remediation Runbook retrieval & strict validation)
 
+    An investigation covers two questions: is the beneficiary itself a listed party
+    (name screening, then identifier comparison), and is it owned 50% or more by
+    listed parties (ownership tracing).
+
     Two ways to draft the decision, selected at construction:
       * rules  (default)        - deterministic if/else on the tool results
       * gemini (use_vertex_llm) - Gemini drafts it; the provenance gate checks the draft
@@ -141,9 +163,13 @@ class PaymentComplianceGatekeeper:
         llm: Any = None,
         spanner_client: Optional[SpannerGraphComplianceClient] = None,
         retriever: Optional[FAISSRegulatoryRetriever] = None,
+        sanctions_list: Optional[List[dict]] = None,
     ):
         self.spanner_client = spanner_client or SpannerGraphComplianceClient(use_mock=True)
         self.faiss_retriever = retriever or FAISSRegulatoryRetriever()
+        self.sanctions_list = (
+            sanctions_list if sanctions_list is not None else reference_data.SANCTIONS_LIST
+        )
         self.use_vertex_llm = use_vertex_llm or llm is not None
         if llm is not None:
             self.llm = llm
@@ -160,10 +186,59 @@ class PaymentComplianceGatekeeper:
 
         return GeminiDecisionLLM()
 
+    # ---------------- Node 0: Sanctions-List Name Screening (alert generation) ----------------
+    def _beneficiary_identity(self, tx: PaymentTransaction) -> tuple:
+        """(name, country, registration number) for the beneficiary.
+
+        The payment message wins. When it carries no name, the name and country on the
+        beneficiary's own record are used; an unknown beneficiary with no name has none.
+        """
+        name, country = tx.beneficiary_name.strip(), tx.beneficiary_country.strip()
+        if not name:
+            record = self.spanner_client.get_entity_record(tx.beneficiary_id)
+            if record:
+                name = record["entity_name"]
+                country = country or record["jurisdiction"]
+        return name, country, tx.beneficiary_registration_no.strip()
+
+    def screen_party_names(self, state: GatekeeperState) -> dict:
+        name, _country, _registration = self._beneficiary_identity(state["transaction"])
+        hits = screen_name(name, self.sanctions_list) if name else []
+        return {"name_hits": hits}
+
+    def _resolve_list_hits(self, tx: PaymentTransaction, hits: List[NameScreeningHit]) -> tuple:
+        """Tool: settle each alert by comparing identifiers with the list entry."""
+        _name, country, registration = self._beneficiary_identity(tx)
+        resolved = adjudicate_hits(hits, country or None, registration or None)
+        alerts = [h for h in resolved if h.level == "ALERT"]
+        detail = "; ".join(
+            f"{h.list_id} '{h.listed_name}' score {h.score:.2f} -> {h.verdict} ({h.verdict_reason})"
+            for h in alerts
+        )
+        observation = TelemetryObservation(
+            obs_id=f"OBS-WL-{tx.tx_id}",
+            source="WATCHLIST",
+            entity_or_tx_id=tx.tx_id,
+            timestamp="2026-11-13T18:00:00Z",
+            summary=f"Sanctions-list screening of the beneficiary name raised {len(alerts)} alert(s): {detail}.",
+            is_anomalous=any(h.verdict in ("TRUE_MATCH", "UNRESOLVED") for h in alerts),
+        )
+        return resolved, [observation]
+
     # ---------------- Node 1: Formulate Initial Hypotheses ----------------
     def formulate_hypotheses(self, state: GatekeeperState) -> dict:
         tx = state["transaction"]
-        hypotheses: List[ComplianceHypothesis] = [
+        hypotheses: List[ComplianceHypothesis] = []
+        # A screening alert is what opens the investigation, so it is examined first.
+        if any(h.level == "ALERT" for h in state.get("name_hits", [])):
+            hypotheses.append(
+                ComplianceHypothesis(
+                    hypothesis_id="HYP-LIST-MATCH",
+                    description="Beneficiary is the same party as a sanctions-list entry with a matching name.",
+                    required_tool="resolve_list_hits",
+                )
+            )
+        hypotheses += [
             ComplianceHypothesis(
                 hypothesis_id="HYP-VEL-SPIKE",
                 description="Payment exhibits abnormal 24h velocity spike or structuring pattern.",
@@ -197,6 +272,7 @@ class PaymentComplianceGatekeeper:
         observations = list(state["observations"])
         trajectory = list(state["tool_call_trajectory"])
         paths = list(state.get("ownership_paths", []))
+        name_hits = list(state.get("name_hits", []))
 
         for hyp in hypotheses:
             if hyp.status != "PENDING":
@@ -213,6 +289,8 @@ class PaymentComplianceGatekeeper:
                 new_obs = self.spanner_client.query_swift_traces(tx)
             elif tool_name == "query_kyc_audit_logs":
                 new_obs = self.spanner_client.query_kyc_audit_logs(tx.beneficiary_id)
+            elif tool_name == "resolve_list_hits":
+                name_hits, new_obs = self._resolve_list_hits(tx, name_hits)
             else:
                 new_obs = []
 
@@ -245,6 +323,7 @@ class PaymentComplianceGatekeeper:
             "observations": observations,
             "tool_call_trajectory": trajectory,
             "ownership_paths": paths,
+            "name_hits": name_hits,
         }
 
     def _should_continue_probing(
@@ -264,8 +343,12 @@ class PaymentComplianceGatekeeper:
         # Retrieval driven by the structured findings. The blocking query is used only
         # when the 50% threshold is actually met; a sanctioned stake below it is a
         # due-diligence matter, not a freeze.
+        name_hits = state.get("name_hits", [])
+        has_alert = any(h.level == "ALERT" for h in name_hits)
         if sanctioned_pct >= 0.50:
             query = "50 percent aggregate blocked shell entities OFAC velocity restructuring"
+        elif has_alert:
+            query = LIST_QUERY
         elif tx.cross_border or confirmed_hyps:
             query = "cross-border wire 10,000 25 percent offshore manual escalation"
         else:
@@ -291,6 +374,24 @@ class PaymentComplianceGatekeeper:
                     runbooks.append(runbook)
                     text_driven_ids.append(runbook.runbook_id)
 
+        # Name screening found something but the main query was about something else:
+        # add the list-match documents too. When there are only near misses, code takes
+        # no action on them, so these documents are marked like the text-driven ones
+        # and the rule path leaves them alone.
+        if name_hits and query != LIST_QUERY:
+            have_rules = {r.rule_id for r in rules}
+            for rule in self.faiss_retriever.search_rules(LIST_QUERY, top_k=1):
+                if rule.rule_id not in have_rules:
+                    rules.append(rule)
+                    if not has_alert:
+                        text_driven_ids.append(rule.rule_id)
+            have_runbooks = {rb.runbook_id for rb in runbooks}
+            for runbook in self.faiss_retriever.search_runbooks(LIST_QUERY, top_k=1):
+                if runbook.runbook_id not in have_runbooks:
+                    runbooks.append(runbook)
+                    if not has_alert:
+                        text_driven_ids.append(runbook.runbook_id)
+
         return {
             "retrieved_rules": rules,
             "retrieved_runbooks": runbooks,
@@ -311,6 +412,7 @@ class PaymentComplianceGatekeeper:
             block("HYPOTHESES", [h.model_dump() for h in state["hypotheses"]]),
             block("OBSERVATIONS", [o.model_dump() for o in state["observations"]]),
             block("OWNERSHIP PATHS", [p.model_dump() for p in state["ownership_paths"]]),
+            block("SANCTIONS LIST SCREENING", [h.model_dump() for h in state.get("name_hits", [])]),
             block("RETRIEVED RULES", [r.model_dump() for r in state["retrieved_rules"]]),
             block("RETRIEVED RUNBOOKS", [rb.model_dump() for rb in state["retrieved_runbooks"]]),
         ]
@@ -365,8 +467,35 @@ class PaymentComplianceGatekeeper:
         evidence_sentence = f" Evidence: {evidence}" if evidence else ""
         n_sanctioned_paths = sum(1 for p in paths if p.is_sanctioned)
 
-        if sanctioned_pct >= 0.50:
-            cited_rules = [r for r in rule_ids if "OFAC" in r] or rule_ids[:1]
+        # Name screening: the rule path acts on adjudicated alerts only, never on near misses.
+        alerts = [h for h in state.get("name_hits", []) if h.level == "ALERT"]
+        true_match_ids = [h.list_id for h in alerts if h.verdict == "TRUE_MATCH"]
+        list_rules = [r for r in rule_ids if "LIST" in r]
+        list_sentence = ""
+        if alerts:
+            list_sentence = " Sanctions-list alerts: " + "; ".join(
+                f"{h.list_id} {h.verdict} ({h.verdict_reason})" for h in alerts
+            ) + "."
+
+        if true_match_ids and sanctioned_pct < 0.50:
+            decision = ComplianceDecision(
+                decision="BLOCK",
+                risk_level="CRITICAL",
+                confirmed_hypothesis_ids=confirmed_hyp_ids,
+                correlated_observation_ids=correlated_obs_ids,
+                cited_rule_ids=list_rules or rule_ids[:1],
+                cited_runbook_ids=rb_ids,
+                flagged_entity_ids=flagged_entities,
+                calculated_sanctioned_ownership_pct=sanctioned_pct,
+                remediation_actions=remediation,
+                rationale=(
+                    f"The beneficiary is a listed party: {true_match_ids}."
+                    f"{list_sentence}{evidence_sentence}"
+                ),
+                matched_list_ids=true_match_ids,
+            )
+        elif sanctioned_pct >= 0.50:
+            cited_rules = ([r for r in rule_ids if "OFAC" in r] + (list_rules if true_match_ids else [])) or rule_ids[:1]
             decision = ComplianceDecision(
                 decision="BLOCK",
                 risk_level="CRITICAL",
@@ -381,11 +510,16 @@ class PaymentComplianceGatekeeper:
                     f"Sanctioned parties hold {sanctioned_pct:.1%} of the beneficiary in "
                     f"aggregate across {n_sanctioned_paths} ownership path(s), which meets "
                     f"the 50% blocking threshold. Confirmed hypotheses: {confirmed_hyp_ids}."
-                    f"{evidence_sentence}"
+                    f"{list_sentence}{evidence_sentence}"
                 ),
+                matched_list_ids=true_match_ids,
             )
         elif confirmed_hyp_ids or (tx.cross_border and tx.amount_usd >= 10000.0):
-            cited_rules = [r for r in rule_ids if "FATF" in r or "FINCEN" in r] or rule_ids[:1]
+            cited_rules = (
+                (list_rules if "HYP-LIST-MATCH" in confirmed_hyp_ids else [])
+                or [r for r in rule_ids if "FATF" in r or "FINCEN" in r]
+                or rule_ids[:1]
+            )
             decision = ComplianceDecision(
                 decision="MANUAL_ESCALATION",
                 risk_level="HIGH",
@@ -400,11 +534,15 @@ class PaymentComplianceGatekeeper:
                     f"Manual review required: confirmed hypotheses {confirmed_hyp_ids}; "
                     f"sanctioned ownership is {sanctioned_pct:.1%}, below the 50% blocking "
                     f"threshold; cross-border={tx.cross_border}, amount USD {tx.amount_usd:,.0f}."
-                    f"{evidence_sentence}"
+                    f"{list_sentence}{evidence_sentence}"
                 ),
             )
         else:
-            cited_rules = [r for r in rule_ids if "DOMESTIC" in r] or rule_ids[:1]
+            cited_rules = (
+                (list_rules if alerts else [])
+                or [r for r in rule_ids if "DOMESTIC" in r]
+                or rule_ids[:1]
+            )
             decision = ComplianceDecision(
                 decision="APPROVE",
                 risk_level="LOW",
@@ -418,6 +556,7 @@ class PaymentComplianceGatekeeper:
                 rationale=(
                     "Every risk hypothesis was refuted by the tool checks; sanctioned "
                     "ownership is 0.0% and no structured finding calls for review."
+                    f"{list_sentence}"
                 ),
             )
 
@@ -494,6 +633,19 @@ class PaymentComplianceGatekeeper:
         if expected_pct >= 0.50 and draft.decision != "BLOCK":
             errors.append("Policy violation: sanctioned ownership >= 50% must be BLOCK.")
 
+        # 5. Verify Sanctions-List Matches: grounded ids, and a confirmed match is a block
+        name_hits = state.get("name_hits", [])
+        hit_ids = {h.list_id for h in name_hits}
+        for lid in draft.matched_list_ids:
+            if lid not in hit_ids:
+                errors.append(f"Ungrounded list_id '{lid}' not in {sorted(hit_ids)}")
+        confirmed_matches = sorted(h.list_id for h in name_hits if h.verdict == "TRUE_MATCH")
+        missing = [lid for lid in confirmed_matches if lid not in draft.matched_list_ids]
+        if missing:
+            errors.append(f"List match mismatch: matched_list_ids must include {missing}")
+        if confirmed_matches and draft.decision != "BLOCK":
+            errors.append("Policy violation: a confirmed sanctions-list match must be BLOCK.")
+
         if errors:
             return {
                 "provenance_valid": False,
@@ -543,6 +695,7 @@ class PaymentComplianceGatekeeper:
         GraphCls = StateGraph if LANGGRAPH_AVAILABLE else _FallbackStateGraph
         workflow = GraphCls(GatekeeperState)
 
+        workflow.add_node("screen_party_names", self.screen_party_names)
         workflow.add_node("formulate_hypotheses", self.formulate_hypotheses)
         workflow.add_node("dynamic_tool_verification", self.dynamic_tool_verification)
         workflow.add_node("correlate_and_retrieve_rag", self.correlate_and_retrieve_rag)
@@ -550,7 +703,8 @@ class PaymentComplianceGatekeeper:
         workflow.add_node("validate_provenance", self.validate_provenance)
         workflow.add_node("fallback_escalation", self.fallback_escalation)
 
-        workflow.set_entry_point("formulate_hypotheses")
+        workflow.set_entry_point("screen_party_names")
+        workflow.add_edge("screen_party_names", "formulate_hypotheses")
         workflow.add_edge("formulate_hypotheses", "dynamic_tool_verification")
 
         workflow.add_conditional_edges(
@@ -584,6 +738,7 @@ class PaymentComplianceGatekeeper:
             "observations": [],
             "tool_call_trajectory": [],
             "ownership_paths": [],
+            "name_hits": [],
             "retrieved_rules": [],
             "retrieved_runbooks": [],
             "text_driven_ids": [],

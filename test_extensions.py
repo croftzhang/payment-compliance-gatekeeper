@@ -17,6 +17,7 @@ import numpy as np
 
 import braintrust_eval as ev
 import compare_modes
+import name_screening as ns
 import reference_data
 import spanner_graph_client as sg
 from compliance_graph_agent import DECISION_INSTRUCTIONS, PaymentComplianceGatekeeper
@@ -108,6 +109,8 @@ class FakeSnapshot:
                 raise self.gql_error
             wanted = params["beneficiary_id"]
             return [r for r in self.gql_rows if r[6][0] == wanted]
+        if "WHERE entity_id" in sql:
+            return [(e[1], e[3]) for e in reference_data.ENTITIES if e[0] == params["entity_id"]]
         if "FROM Entities" in sql:
             return [(e[0], e[1], e[3], e[4], e[5]) for e in reference_data.ENTITIES]
         if "FROM EntityOwnership" in sql:
@@ -235,9 +238,13 @@ class TestRulePathOnAllCases(unittest.TestCase):
     def setUpClass(cls):
         cls.outputs = {tx_id: ev.task_fn(case["input"]) for tx_id, case in CASES.items()}
 
-    def test_structured_and_distractor_cases_are_decided_correctly(self):
+    # What the rule path is known to miss: signals in free text, and a listed name
+    # written in a way that scores just under the screening threshold.
+    KNOWN_MISSES = {"TX-2026-1005", "TX-2026-2201", "TX-2026-2202", "TX-2026-8105"}
+
+    def test_every_case_outside_the_known_misses_is_decided_correctly(self):
         for tx_id, case in CASES.items():
-            if case["stratum"] == "text_signal":
+            if tx_id in self.KNOWN_MISSES:
                 continue
             out = self.outputs[tx_id]
             self.assertEqual(out["decision"], case["expected"]["decision"], tx_id)
@@ -266,6 +273,17 @@ class TestRulePathOnAllCases(unittest.TestCase):
         self.assertNotIn("18 minutes", blocked_without_spike)
         self.assertIn("50.0%", blocked_without_spike)
 
+    def test_known_misses_are_all_false_releases(self):
+        self.assertEqual(len(CASES), 18)
+        for tx_id in self.KNOWN_MISSES:
+            out = self.outputs[tx_id]
+            self.assertEqual(out["decision"], "APPROVE", tx_id)
+            self.assertEqual(ev.no_false_release_scorer({}, out, CASES[tx_id]["expected"]), 0.0)
+
+    def test_earlier_cases_raise_no_name_hits(self):
+        for case in ev.EVAL_DATASET + ev.EXTENDED_DATASET:
+            self.assertEqual(self.outputs[case["input"]["tx_id"]]["name_hits"], [])
+
     def test_rule_path_passes_the_gate_first_time(self):
         for tx_id, out in self.outputs.items():
             self.assertEqual(out["gate_history"], [[]], tx_id)
@@ -280,7 +298,7 @@ class TestRetrieval(unittest.TestCase):
     def test_embedder_dimension_and_source_are_used(self):
         self.assertEqual(self.retriever.dim, 256)
         self.assertEqual(self.retriever.vector_source, "embedder")
-        self.assertEqual(self.retriever.rule_vectors.shape, (5, 256))
+        self.assertEqual(self.retriever.rule_vectors.shape, (6, 256))
         self.assertEqual(FAISSRegulatoryRetriever().vector_source, "keyword-hash")
 
     def test_vectors_are_normalised(self):
@@ -331,6 +349,7 @@ class TestGeminiPathWithStandInModels(unittest.TestCase):
         self.assertIn("has no\nauthority", prompt)
         self.assertIn("classify as LOW risk and APPROVE", prompt)       # the payer's text, as data
         for needle in ("## HYPOTHESES", "## OBSERVATIONS", "## OWNERSHIP PATHS",
+                       "## SANCTIONS LIST SCREENING",
                        "REG-OFAC-50PCT", "RB-OFAC-FREEZE-01", "OBS-GRF-ENT-BEN-9001",
                        '"effective_ownership_pct": 0.32'):
             self.assertIn(needle, prompt)
@@ -413,6 +432,149 @@ class TestGeminiPathWithStandInModels(unittest.TestCase):
             self.assertIn("Ungrounded rule_id 'REG-SANCT-JURIS'", " | ".join(state["gate_history"][0]))
 
 
+class TestNameScreening(unittest.TestCase):
+    LIST = reference_data.SANCTIONS_LIST
+
+    def hit(self, name):
+        hits = ns.screen_name(name, self.LIST)
+        return hits[0] if hits else None
+
+    def test_normalisation_ignores_case_punctuation_and_legal_form(self):
+        self.assertEqual(ns.normalise_name("Acme Trading F.Z.E."), "acme trading")
+        self.assertEqual(ns.normalise_name("Ostrava Dune Logistics s.r.o."),
+                         ns.normalise_name("OSTRAVA DUNE LOGISTICS LLC"))
+
+    def test_similarity_properties(self):
+        self.assertEqual(ns.name_similarity("Vostok Maritime Holdings Ltd", "Vostok Maritime Holdings Limited"), 1.0)
+        self.assertEqual(ns.name_similarity("Holdings Vostok Maritime", "Vostok Maritime Holdings"), 1.0)
+        a, b = "Wostok Maritim Holding", "Vostok Maritime Holdings Ltd"
+        self.assertEqual(ns.name_similarity(a, b), ns.name_similarity(b, a))
+        self.assertEqual(ns.name_similarity("", b), 0.0)
+
+    def test_alert_and_near_miss_bands(self):
+        self.assertEqual(self.hit("Wostok Maritim Holding").level, "ALERT")
+        abbreviated, unrelated = self.hit("Korvald Mer. Trdg FZE"), self.hit("Meridian Trading Co")
+        self.assertEqual((abbreviated.level, unrelated.level), ("NEAR_MISS", "NEAR_MISS"))
+        self.assertEqual(abbreviated.score, unrelated.score)        # the score alone cannot tell them apart
+        self.assertIsNone(self.hit("Great Lakes Industrial Supply Inc"))
+
+    def test_alias_can_be_the_best_match(self):
+        self.assertEqual(self.hit("Korvald Trading").matched_on, "Korvald Trading")
+
+    def test_no_unlisted_entity_in_the_graph_resembles_a_listed_name(self):
+        for entity in reference_data.ENTITIES:
+            if not entity[4]:                                        # not itself sanctioned
+                self.assertEqual(ns.screen_name(entity[1], self.LIST), [], entity[1])
+
+    def test_adjudication_rules(self):
+        def verdict(name, country, registration):
+            return ns.adjudicate_hits(ns.screen_name(name, self.LIST), country, registration)[0].verdict
+
+        self.assertEqual(verdict("Wostok Maritim Holding", "PA", "VG-1482207"), "TRUE_MATCH")       # number decides
+        self.assertEqual(verdict("Vostok Maritime Holdings Ltd", "VG", None), "TRUE_MATCH")          # exact + country
+        self.assertEqual(verdict("Ostrava Dune Logistics s.r.o.", "CZ", "CZ-27845113"), "FALSE_POSITIVE")
+        self.assertEqual(verdict("Ostrava Dune Logistics s.r.o.", "CZ", None), "UNRESOLVED")         # one conflict only
+        self.assertEqual(verdict("Wostok Maritim Holding", "VG", None), "UNRESOLVED")                # not exact
+        self.assertEqual(verdict("Vostok Maritime Holdings Ltd", "VG", "XX-000"), "UNRESOLVED")      # number conflicts
+        self.assertEqual(verdict("Korvald Mer. Trdg FZE", "AE", None), "NOT_ADJUDICATED")            # near miss
+
+    def test_confirmed_match_is_investigated_first_and_blocked(self):
+        state = PaymentComplianceGatekeeper().run(tx("TX-2026-8101"))
+        self.assertEqual(state["tool_call_trajectory"][0], "resolve_list_hits")
+        hypothesis = next(h for h in state["hypotheses"] if h.hypothesis_id == "HYP-LIST-MATCH")
+        self.assertEqual(hypothesis.status, "CONFIRMED")
+        watchlist = [o for o in state["observations"] if o.source == "WATCHLIST"]
+        self.assertEqual(len(watchlist), 1)
+        self.assertTrue(watchlist[0].is_anomalous)
+        decision = state["final_decision"]
+        self.assertEqual(decision.decision, "BLOCK")
+        self.assertEqual(decision.matched_list_ids, ["SDN-90001"])
+        self.assertEqual(decision.cited_rule_ids, ["REG-SDN-LIST-MATCH"])
+        self.assertEqual(decision.calculated_sanctioned_ownership_pct, 0.0)   # ownership alone says nothing
+
+    def test_same_name_different_company_is_cleared_with_the_reason_recorded(self):
+        state = PaymentComplianceGatekeeper().run(tx("TX-2026-8103"))
+        hypothesis = next(h for h in state["hypotheses"] if h.hypothesis_id == "HYP-LIST-MATCH")
+        self.assertEqual(hypothesis.status, "REFUTED")
+        self.assertEqual(state["final_decision"].decision, "APPROVE")
+        self.assertIn("FALSE_POSITIVE (registration number and country both differ)",
+                      state["final_decision"].rationale)
+
+    def test_payment_straight_to_a_listed_entity_is_caught_by_name_not_ownership(self):
+        """Ownership tracing looks at who owns the beneficiary, so it finds nothing here."""
+        direct = PaymentTransaction(
+            tx_id="TX-DIRECT", originator_id="ENT-ORIG-US01", beneficiary_id="ENT-UBO-SDN1",
+            amount_usd=5000.0, purpose_code="SERVICES", cross_border=False,
+        )
+        state = PaymentComplianceGatekeeper().run(direct)
+        self.assertEqual(state["ownership_paths"], [])
+        self.assertEqual(state["name_hits"][0].verdict, "TRUE_MATCH")       # name and country from its record
+        self.assertEqual(state["final_decision"].decision, "BLOCK")
+
+    def test_near_miss_opens_no_investigation_on_the_rule_path(self):
+        state = PaymentComplianceGatekeeper().run(tx("TX-2026-8105"))
+        self.assertEqual([h.level for h in state["name_hits"]], ["NEAR_MISS"])
+        self.assertNotIn("resolve_list_hits", state["tool_call_trajectory"])
+        self.assertIn("REG-SDN-LIST-MATCH", state["text_driven_ids"])        # retrieved, but only for the model
+        self.assertNotIn("REG-SDN-LIST-MATCH", state["final_decision"].cited_rule_ids)
+
+    def test_gate_blocks_release_of_a_confirmed_match(self):
+        approve = rule_decision("TX-2026-8101", decision="APPROVE", risk_level="LOW")
+        state = PaymentComplianceGatekeeper(llm=ScriptedLLM(approve)).run(tx("TX-2026-8101"))
+        self.assertIn("a confirmed sanctions-list match must be BLOCK", " | ".join(state["gate_history"][0]))
+        self.assertNotEqual(state["final_decision"].decision, "APPROVE")
+
+    def test_gate_checks_the_list_ids_in_the_decision(self):
+        invented = rule_decision("TX-2026-8101", matched_list_ids=["SDN-90001", "SDN-00000"])
+        state = PaymentComplianceGatekeeper(llm=ScriptedLLM(invented)).run(tx("TX-2026-8101"))
+        self.assertIn("Ungrounded list_id 'SDN-00000'", " | ".join(state["gate_history"][0]))
+        omitted = rule_decision("TX-2026-8101", matched_list_ids=[])
+        state = PaymentComplianceGatekeeper(llm=ScriptedLLM(omitted)).run(tx("TX-2026-8101"))
+        self.assertIn("List match mismatch", " | ".join(state["gate_history"][0]))
+
+    def test_model_can_escalate_a_near_miss_and_cite_the_list_documents(self):
+        escalate = rule_decision(
+            "TX-2026-8105", decision="MANUAL_ESCALATION", risk_level="HIGH",
+            cited_rule_ids=["REG-SDN-LIST-MATCH"], cited_runbook_ids=["RB-LIST-HIT-05"],
+        )
+        out = ev.task_fn(CASES["TX-2026-8105"]["input"], PaymentComplianceGatekeeper(llm=ScriptedLLM(escalate)))
+        self.assertTrue(out["provenance_valid"])
+        for scorer in ev.COMPARISON_SCORERS:
+            self.assertEqual(scorer({}, out, CASES["TX-2026-8105"]["expected"]), 1.0, scorer.__name__)
+
+    def test_model_may_clear_an_unresolved_alert(self):
+        """By design: settling hits that code could not is the model's job. The cost is
+        that a wrong clearance is a false release the gate does not stop."""
+        clear = rule_decision("TX-2026-8104", decision="APPROVE", risk_level="LOW")
+        gk = PaymentComplianceGatekeeper(llm=ScriptedLLM(clear))
+        out = ev.task_fn(CASES["TX-2026-8104"]["input"], gk)
+        self.assertTrue(out["provenance_valid"])
+        self.assertEqual(out["decision"], "APPROVE")
+        self.assertEqual(ev.no_false_release_scorer({}, out, CASES["TX-2026-8104"]["expected"]), 0.0)
+
+    def test_screening_block_in_the_prompt(self):
+        llm = ScriptedLLM(rule_decision("TX-2026-8105"))
+        PaymentComplianceGatekeeper(llm=llm).run(tx("TX-2026-8105"))
+        hits = json.loads(llm.prompts[0].split("## SANCTIONS LIST SCREENING\n", 1)[1].split("\n## ", 1)[0])
+        self.assertEqual(hits[0]["level"], "NEAR_MISS")
+        self.assertEqual(hits[0]["listed_name"], "Korvald Meridian Trading FZE")
+        self.assertEqual(hits[0]["party_name"], "Korvald Mer. Trdg FZE")
+        self.assertIn("NEAR_MISS entries scored just", llm.prompts[0])
+
+    def test_entity_record_lookup(self):
+        client = sg.SpannerGraphComplianceClient(use_mock=True)
+        self.assertEqual(client.get_entity_record("ENT-BEN-9001"),
+                         {"entity_name": "Baltic Meridian Shipping Ltd", "jurisdiction": "CY"})
+        self.assertIsNone(client.get_entity_record("EXT-8101"))
+
+    @unittest.skipUnless(sg.SPANNER_AVAILABLE, "google-cloud-spanner not installed")
+    def test_entity_record_lookup_through_spanner_sql(self):
+        cloud = client_on_fake_database()
+        self.assertEqual(cloud.get_entity_record("ENT-UBO-SDN1"),
+                         {"entity_name": "Vostok Maritime Holdings Ltd", "jurisdiction": "VG"})
+        self.assertIsNone(cloud.get_entity_record("EXT-8101"))
+
+
 class TestComparisonRunner(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -424,16 +586,16 @@ class TestComparisonRunner(unittest.TestCase):
 
     def test_rule_path_runs_once_and_model_path_runs_each_repeat(self):
         counts = self.df.groupby("mode").size().to_dict()
-        self.assertEqual(counts, {"rules": 12, "gemini": 24})
-        self.assertEqual(len(self.runs), 36)
+        self.assertEqual(counts, {"rules": 18, "gemini": 36})
+        self.assertEqual(len(self.runs), 54)
 
     def test_summary_counts(self):
         overall = compare_modes.summarise(self.df, ["mode"]).set_index("mode")
-        self.assertEqual(overall.loc["rules", "decision_correct"], "9/12")
-        self.assertEqual(overall.loc["rules", "false_release"], 3)
+        self.assertEqual(overall.loc["rules", "decision_correct"], "14/18")
+        self.assertEqual(overall.loc["rules", "false_release"], 4)
         self.assertEqual(overall.loc["rules", "over_restricted"], 0)
-        self.assertEqual(overall.loc["rules", "gate_first_pass"], "12/12")
-        self.assertEqual(overall.loc["gemini", "decision_correct"], "18/24")
+        self.assertEqual(overall.loc["rules", "gate_first_pass"], "18/18")
+        self.assertEqual(overall.loc["gemini", "decision_correct"], "28/36")
         self.assertEqual(overall.loc["gemini", "fell_back"], 0)
 
     def test_summary_by_case_type(self):
@@ -442,6 +604,10 @@ class TestComparisonRunner(unittest.TestCase):
         row = table[(table["stratum"] == "text_signal") & (table["mode"] == "rules")].iloc[0]
         self.assertEqual(row["decision_correct"], "0/3")
         self.assertEqual(row["false_release"], 3)
+        near = table[(table["stratum"] == "name_near_miss") & (table["mode"] == "rules")].iloc[0]
+        self.assertEqual(near["decision_correct"], "1/2")
+        alert = table[(table["stratum"] == "name_alert") & (table["mode"] == "rules")].iloc[0]
+        self.assertEqual(alert["decision_correct"], "4/4")
 
     def test_model_calls_are_attributed_to_runs(self):
         gemini_rows = self.df[self.df["mode"] == "gemini"]
@@ -453,6 +619,11 @@ class TestComparisonRunner(unittest.TestCase):
         self.assertEqual(compare_modes.categorise_error("Ownership math mismatch: 52.0 != 0.52"), "ownership arithmetic")
         self.assertEqual(compare_modes.categorise_error("Policy violation: sanctioned ownership >= 50% must be BLOCK."), ">=50% not blocked")
         self.assertEqual(compare_modes.categorise_error("Missing draft decision."), "no usable draft")
+        self.assertEqual(compare_modes.categorise_error(
+            "Policy violation: a confirmed sanctions-list match must be BLOCK."), "list match not blocked")
+        self.assertEqual(compare_modes.categorise_error("Ungrounded list_id 'SDN-1' not in []"), "list match ids")
+        self.assertEqual(compare_modes.categorise_error(
+            "List match mismatch: matched_list_ids must include ['SDN-90001']"), "list match ids")
         self.assertEqual(compare_modes.error_breakdown(self.df), {"rules": {}, "gemini": {}})
 
     def test_disagreeing_repeats_are_reported(self):
@@ -503,8 +674,8 @@ class TestEvaluationIntegrations(unittest.TestCase):
 
             runs = [{"case": c, "repeat": 1, "output": ev.task_fn(c["input"])} for c in ev.ALL_CASES]
             logged = ev.log_runs_to_braintrust(runs, mode="rules")
-            self.assertEqual(logged["rows"], 12)
-            self.assertAlmostEqual(logged["scores"]["no_false_release_scorer"], 9 / 12, places=4)
+            self.assertEqual(logged["rows"], 18)
+            self.assertAlmostEqual(logged["scores"]["no_false_release_scorer"], 14 / 18, places=4)
 
 
 class FakeUsage:
@@ -672,13 +843,19 @@ class PromptReadingFakeModels(FakeModels):
         paths = self._section(contents, "OWNERSHIP PATHS")
         rules = self._section(contents, "RETRIEVED RULES")
         runbooks = self._section(contents, "RETRIEVED RUNBOOKS")
+        hits = self._section(contents, "SANCTIONS LIST SCREENING")
+        true_matches = [h["list_id"] for h in hits if h["verdict"] == "TRUE_MATCH"]
+        unresolved = [h for h in hits if h["verdict"] == "UNRESOLVED"]
+        suspicious_near_miss = [h for h in hits if h["level"] == "NEAR_MISS"
+                                and h["listed_country"] == txn["beneficiary_country"]]
         pct = round(min(sum(p["effective_ownership_pct"] for p in paths if p["is_sanctioned"]), 1.0), 4)
         confirmed = [h["hypothesis_id"] for h in hypotheses if h["status"] == "CONFIRMED"]
         text = txn["remittance_info"].lower()
         nexus = any(word in text for word in ("crimea", "iran", "bandar abbas"))
-        if pct >= 0.5:
+        if pct >= 0.5 or true_matches:
             decision = "BLOCK"
-        elif confirmed or nexus or (txn["cross_border"] and txn["amount_usd"] >= 10000):
+        elif (confirmed or nexus or unresolved or suspicious_near_miss
+              or (txn["cross_border"] and txn["amount_usd"] >= 10000)):
             decision = "MANUAL_ESCALATION"
         else:
             decision = "APPROVE"
@@ -696,6 +873,7 @@ class PromptReadingFakeModels(FakeModels):
             ),
             remediation_actions=runbooks[0]["action_steps"],
             rationale="Drafted by the stand-in model from the evidence in the prompt.",
+            matched_list_ids=true_matches,
         )
         return FakeResponse(parsed=draft)
 
@@ -739,24 +917,25 @@ class TestFullCommandLineRehearsal(unittest.TestCase):
             folder = next((Path(tmp) / "results").iterdir())
             summary = json.loads((folder / "summary.json").read_text())
             overall = {row["mode"]: row for row in summary["overall"]}
-            self.assertEqual(overall["rules"]["runs"], 12)
-            self.assertEqual(overall["gemini"]["runs"], 24)
+            self.assertEqual(overall["rules"]["runs"], 18)
+            self.assertEqual(overall["gemini"]["runs"], 36)
+            self.assertEqual(overall["gemini"]["decision_correct"], "36/36")
             self.assertEqual(overall["gemini"]["false_release"], 0)
             self.assertEqual(overall["gemini"]["fell_back"], 0)
-            self.assertEqual(overall["gemini"]["gate_first_pass"], "22/24")       # 9981 retried twice over
+            self.assertEqual(overall["gemini"]["gate_first_pass"], "34/36")       # 9981 retried twice over
             self.assertEqual(summary["first_draft_gate_errors"]["gemini"], {"ownership arithmetic": 2})
             usage = summary["gemini_usage"]["gemini"]
-            self.assertEqual(usage["calls"], 26)                                   # 24 runs + 2 retries
+            self.assertEqual(usage["calls"], 38)                                   # 36 runs + 2 retries
             self.assertEqual(usage["api_errors"], 0)
             self.assertGreater(usage["est_cost_usd"], 0)
             self.assertIn("error", summary["external"]["vertex_rules"])            # no credentials here
             if ev.BRAINTRUST_AVAILABLE:
-                self.assertEqual(summary["external"]["braintrust_gemini"]["rows"], 24)
+                self.assertEqual(summary["external"]["braintrust_gemini"]["rows"], 36)
                 self.assertFalse(summary["external"]["braintrust_gemini"]["sent_to_braintrust"])
-            self.assertEqual(len(json.loads((folder / "outputs.json").read_text())), 36)
-            # the corpus (5 rules + 4 runbooks) was embedded once, as documents
+            self.assertEqual(len(json.loads((folder / "outputs.json").read_text())), 54)
+            # the corpus (6 rules + 5 runbooks) was embedded once, as documents
             doc_calls = [c for c in fake.models.embed_calls if c["config"]["task_type"] == "RETRIEVAL_DOCUMENT"]
-            self.assertEqual(len(doc_calls), 9)
+            self.assertEqual(len(doc_calls), 11)
             self.assertTrue(all(c["config"]["output_dimensionality"] == 768 for c in fake.models.embed_calls))
 
 
